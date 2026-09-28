@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Image Resizer edge - private S3 bucket for the SPA behind CloudFront (Origin
+  Access Control), strict security headers, SPA routing (/admin), www-to-apex
+  redirect, /api/* routed to the API origin with a shared-secret header, and
+  optional Route 53 records. The stack can live in any region; the ACM
+  certificate (and a WAF web ACL, if used) must be created in us-east-1.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: API origin }
+        Parameters: [ApiOriginDomainName, OriginVerifySecret]
+      - Label: { default: Website domain (optional; leave blank to use *.cloudfront.net) }
+        Parameters: [SiteDomainName, IncludeWww, AcmCertificateArn, HostedZoneId]
+      - Label: { default: Protection and cost }
+        Parameters: [WebAclArn, PriceClass]
+    ParameterLabels:
+      ApiOriginDomainName: { default: API origin (OriginDomainName output of the server stack) }
+      OriginVerifySecret: { default: Origin secret (same value as the ORIGIN_VERIFY_SECRET parameter) }
+      SiteDomainName: { default: 'Website domain (e.g. example.com)' }
+      AcmCertificateArn: { default: ACM certificate ARN from us-east-1 }
+
+Parameters:
+  ApiOriginDomainName:
+    Type: String
+    Description: HTTPS origin for /api/* (e.g. origin.example.com).
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+  OriginVerifySecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: >-
+      Sent to the origin as X-Origin-Verify. Store the same value as the SecureString
+      parameter <SsmParameterPath>/ORIGIN_VERIFY_SECRET so the API accepts only CloudFront.
+  SiteDomainName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$'
+    Description: Apex domain the site is served on. Requires AcmCertificateArn.
+  IncludeWww:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Also answer on www.<domain> and redirect it to the apex. The certificate must cover it.
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate in us-east-1 covering the domain (and www). Required with SiteDomainName.
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route 53 hosted zone ID of the domain; when set, DNS records pointing at CloudFront are created.
+  WebAclArn:
+    Type: String
+    Default: ''
+    Description: Optional AWS WAF (CLOUDFRONT scope, created in us-east-1) web ACL ARN.
+  PriceClass:
+    Type: String
+    Default: PriceClass_200
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: PriceClass_200 includes Australia, India and most of Asia; PriceClass_100 is North America/Europe only.
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref SiteDomainName, '']]
+  HasWww: !And [!Condition HasDomain, !Equals [!Ref IncludeWww, 'true']]
+  CreateRecords: !And [!Condition HasDomain, !Not [!Equals [!Ref HostedZoneId, '']]]
+  CreateWwwRecords: !And [!Condition CreateRecords, !Condition HasWww]
+  HasWebAcl: !Not [!Equals [!Ref WebAclArn, '']]
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt SiteBucket.Arn, !Sub '${SiteBucket.Arn}/*']
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-spa'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Viewer-request on the SPA behaviour only (never /api/*):
+  #  - www.<domain> -> 301 to the apex (one canonical host, better for SEO/AdSense)
+  #  - extension-less paths such as /admin -> /index.html (client-side routing)
+  SpaRouter:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-spa-router'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: www redirect and SPA routing
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var host = request.headers.host ? request.headers.host.value : '';
+          if (host.indexOf('www.') === 0) {
+            var parts = [];
+            for (var key in request.querystring) {
+              var entry = request.querystring[key];
+              var values = entry.multiValue ? entry.multiValue : [entry];
+              for (var i = 0; i < values.length; i++) {
+                parts.push(encodeURIComponent(key) + (values[i].value ? '=' + encodeURIComponent(values[i].value) : ''));
+              }
+            }
+            return {
+              statusCode: 301,
+              statusDescription: 'Moved Permanently',
+              headers: { location: { value: 'https://' + host.substring(4) + request.uri + (parts.length ? '?' + parts.join('&') : '') } }
+            };
+          }
+          if (request.uri !== '/' && request.uri.indexOf('.') === -1) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+
+  # Mirrors server/src/middleware/security.ts (spaHelmet) for the S3-hosted build.
+  SpaSecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AWS::StackName}-spa-security'
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: >-
+              default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:;
+              font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self';
+              form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests
+            Override: true
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { FrameOption: DENY, Override: true }
+          ReferrerPolicy: { ReferrerPolicy: strict-origin-when-cross-origin, Override: true }
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 63072000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+        CustomHeadersConfig:
+          Items:
+            - Header: Permissions-Policy
+              Value: 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'
+              Override: true
+            - Header: Cross-Origin-Opener-Policy
+              Value: same-origin
+              Override: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Image Resizer (${AWS::StackName})'
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        DefaultRootObject: index.html
+        Aliases: !If
+          - HasDomain
+          - !If [HasWww, [!Ref SiteDomainName, !Sub 'www.${SiteDomainName}'], [!Ref SiteDomainName]]
+          - !Ref 'AWS::NoValue'
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        WebACLId: !If [HasWebAcl, !Ref WebAclArn, !Ref 'AWS::NoValue']
+        Origins:
+          - Id: spa
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: api
+            DomainName: !Ref ApiOriginDomainName
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              HTTPSPort: 443
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginVerifySecret
+        DefaultCacheBehavior:
+          TargetOriginId: spa
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SpaSecurityHeaders
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRouter.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          # The API is never cached: every request carries a private upload or admin session.
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+        # No custom error responses: they would also rewrite API 4xx bodies.
+
+  # Z2FDTNDATAQYW2 is the fixed hosted zone ID for every CloudFront alias target.
+  ApexIpv4:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateRecords
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${SiteDomainName}.'
+      Type: A
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+  ApexIpv6:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateRecords
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${SiteDomainName}.'
+      Type: AAAA
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+  WwwIpv4:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateWwwRecords
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${SiteDomainName}.'
+      Type: A
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+  WwwIpv6:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateWwwRecords
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${SiteDomainName}.'
+      Type: AAAA
+      AliasTarget: { DNSName: !GetAtt Distribution.DomainName, HostedZoneId: Z2FDTNDATAQYW2 }
+
+Outputs:
+  SiteBucketName:
+    Description: GitHub variable SITE_BUCKET.
+    Value: !Ref SiteBucket
+  DistributionId:
+    Description: GitHub variable CLOUDFRONT_DISTRIBUTION_ID.
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Description: CloudFront address (works before DNS is set up).
+    Value: !GetAtt Distribution.DomainName
+  SiteUrl:
+    Description: GitHub variable PUBLIC_URL.
+    Value: !If [HasDomain, !Sub 'https://${SiteDomainName}', !Sub 'https://${Distribution.DomainName}']

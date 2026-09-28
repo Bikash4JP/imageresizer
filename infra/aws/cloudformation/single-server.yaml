@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Image Resizer API - starter single-server stack. One Graviton EC2 instance
+  (no SSH, IMDSv2, SSM-managed) with an Elastic IP reachable only from
+  CloudFront over HTTPS, a DynamoDB table for reviews, the private release
+  bucket, and the origin DNS record. Pair with edge.yaml for the website.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Domain }
+        Parameters: [DomainName, HostedZoneId, AcmeEmail]
+      - Label: { default: Network (the default VPC is fine) }
+        Parameters: [VpcId, SubnetId, CloudFrontPrefixListId]
+      - Label: { default: Server }
+        Parameters: [InstanceType, AmiId, SsmParameterPath, EnvironmentName]
+    ParameterLabels:
+      DomainName: { default: Your domain (e.g. example.com) }
+      HostedZoneId: { default: Route 53 hosted zone of that domain }
+      AcmeEmail: { default: Email for certificate expiry notices (optional) }
+      SubnetId: { default: A PUBLIC subnet of that VPC }
+      CloudFrontPrefixListId: { default: CloudFront origin-facing prefix list ID (pl-...) }
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Apex domain, lower case. The API origin becomes origin.<DomainName>.
+    AllowedPattern: '^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$'
+    ConstraintDescription: lower-case domain such as example.com
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+  AcmeEmail:
+    Type: String
+    Default: ''
+    Description: Let's Encrypt contact for expiry warnings (renewal is automatic). Leave blank for none.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Must be a public subnet (route to an internet gateway), e.g. any default-VPC subnet.
+  CloudFrontPrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+    Description: >-
+      VPC console > Managed prefix lists > com.amazonaws.global.cloudfront.origin-facing > Prefix list ID.
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.small, t4g.medium, t4g.large]
+    Description: t4g.small (2 GiB) suits light traffic with PROCESSING_CONCURRENCY=1; resize later by updating the stack.
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  SsmParameterPath:
+    Type: String
+    Default: /image-resizer/prod
+    AllowedPattern: '^/[a-zA-Z0-9_/-]+[a-zA-Z0-9_-]$'
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+    Description: The deploy pipeline targets instances tagged Environment=<this>.
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-releases
+            Status: Enabled
+            Prefix: releases/image-resizer-
+            ExpirationInDays: 180
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+  # Reviews and ratings. Layout documented in server/src/services/feedback/dynamoStore.ts.
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: gsi1pk, AttributeType: S }
+        - { AttributeName: gsi1sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: gsi1
+          KeySchema:
+            - { AttributeName: gsi1pk, KeyType: HASH }
+            - { AttributeName: gsi1sk, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: App, Value: image-resizer }
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Image Resizer API - HTTPS from CloudFront origin-facing IPs only; no SSH (use Session Manager)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+          Description: CloudFront origin-facing
+      Tags:
+        - { Key: Name, Value: !Sub 'image-resizer-${EnvironmentName}' }
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: least-privilege-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadReleases
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub '${ArtifactBucket.Arn}/releases/*'
+                  - !Sub '${ArtifactBucket.Arn}/bootstrap/*'
+              - Sid: ReadConfiguration
+                Effect: Allow
+                Action: [ssm:GetParametersByPath, ssm:GetParameters, ssm:GetParameter]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmParameterPath}'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmParameterPath}/*'
+              - Sid: FeedbackTable
+                Effect: Allow
+                # TransactWriteItems is authorised per underlying action.
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:ConditionCheckItem]
+                Resource:
+                  - !GetAtt FeedbackTable.Arn
+                  - !Sub '${FeedbackTable.Arn}/index/*'
+              # certbot DNS-01: may only create/delete the one TXT record that proves domain control.
+              - Sid: AcmeFindZone
+                Effect: Allow
+                Action: [route53:ListHostedZones, route53:GetChange]
+                Resource: '*'
+              - Sid: AcmeChallengeRecordOnly
+                Effect: Allow
+                Action: route53:ChangeResourceRecordSets
+                Resource: !Sub 'arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}'
+                Condition:
+                  ForAllValues:StringEquals:
+                    route53:ChangeResourceRecordSetsNormalizedRecordNames: [!Sub '_acme-challenge.origin.${DomainName}']
+                    route53:ChangeResourceRecordSetsRecordTypes: [TXT]
+                    route53:ChangeResourceRecordSetsActions: [UPSERT, DELETE]
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required # IMDSv2 only
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 16
+              Encrypted: true
+              DeleteOnTermination: true
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref InstanceSecurityGroup]
+          AssociatePublicIpAddress: true
+      Tags:
+        - { Key: Name, Value: !Sub 'image-resizer-${EnvironmentName}' }
+        # The deploy pipeline targets SSM Run Command at these two tags.
+        - { Key: App, Value: image-resizer }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          install -d -m 0750 /etc/image-resizer
+          cat > /etc/image-resizer/deploy.conf <<'EOF'
+          ARTIFACT_BUCKET=${ArtifactBucket}
+          SSM_PATH=${SsmParameterPath}
+          AWS_REGION=${AWS::Region}
+          FEEDBACK_TABLE=${FeedbackTable}
+          NGINX_PROFILE=tls
+          ORIGIN_DOMAIN=origin.${DomainName}
+          ACME_EMAIL=${AcmeEmail}
+          EOF
+          chmod 0640 /etc/image-resizer/deploy.conf
+          # Provision now if the pipeline has already published the bootstrap script;
+          # otherwise the first pipeline deploy provisions this instance.
+          if aws s3 cp --only-show-errors --region ${AWS::Region} s3://${ArtifactBucket}/bootstrap/bootstrap.sh /root/image-resizer-bootstrap.sh; then
+            bash /root/image-resizer-bootstrap.sh
+          else
+            echo "bootstrap not published yet; waiting for the first deploy"
+          fi
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags:
+        - { Key: Name, Value: !Sub 'image-resizer-${EnvironmentName}' }
+
+  OriginRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'origin.${DomainName}.'
+      Type: A
+      TTL: '300'
+      ResourceRecords: [!Ref ElasticIp]
+
+Outputs:
+  ArtifactBucketName:
+    Description: GitHub variable ARTIFACT_BUCKET.
+    Value: !Ref ArtifactBucket
+  FeedbackTableName:
+    Description: DynamoDB table holding reviews (written to the server automatically).
+    Value: !Ref FeedbackTable
+  OriginDomainName:
+    Description: Use as ApiOriginDomainName in the edge stack.
+    Value: !Sub 'origin.${DomainName}'
+  InstanceId:
+    Description: For Session Manager (EC2 console > Connect > Session Manager).
+    Value: !Ref Instance
+  PublicIp:
+    Value: !Ref ElasticIp

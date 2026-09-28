@@ -1,0 +1,173 @@
+name: Deploy
+
+# Releases main to AWS: API to EC2 (via S3 artifact + SSM Run Command), then the
+# SPA to S3 + CloudFront. Authentication is GitHub OIDC -> an environment-scoped
+# IAM role; no AWS keys are stored in GitHub. All configuration below lives in
+# GitHub *environment variables* (none of it is secret):
+#   AWS_REGION, AWS_DEPLOY_ROLE_ARN, ARTIFACT_BUCKET, SITE_BUCKET,
+#   CLOUDFRONT_DISTRIBUTION_ID, PUBLIC_URL, DEPLOY_ENVIRONMENT_TAG (default: production)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Verify and package
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run audit:prod
+      - id: version
+        run: echo "version=$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tarball="$(bash infra/scripts/package-release.sh "$VERSION")"
+          echo "sha256=$(sha256sum "$tarball" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: api-release
+          path: release/*.tgz
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-dist
+          path: client/dist
+          retention-days: 30
+
+  deploy-api:
+    name: Deploy API (EC2)
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      ENV_TAG: ${{ vars.DEPLOY_ENVIRONMENT_TAG || 'production' }}
+      PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: api-release
+          path: release
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: image-resizer-deploy-${{ github.run_id }}
+
+      - name: Publish release artifact and instance bootstrap scripts
+        run: |
+          tarball="release/image-resizer-${VERSION}.tgz"
+          echo "${SHA256}  ${tarball}" | sha256sum -c -
+          aws s3 cp --only-show-errors "$tarball" "s3://${ARTIFACT_BUCKET}/releases/"
+          # Checksum sidecar: lets operators verify/redeploy any past release by hand.
+          echo "$SHA256" | aws s3 cp --only-show-errors - "s3://${ARTIFACT_BUCKET}/releases/image-resizer-${VERSION}.tgz.sha256"
+          mkdir -p extracted
+          tar -xzf "$tarball" -C extracted ./infra/ec2/bootstrap.sh ./infra/ec2/fetch-and-deploy.sh
+          aws s3 cp --only-show-errors extracted/infra/ec2/bootstrap.sh "s3://${ARTIFACT_BUCKET}/bootstrap/bootstrap.sh"
+          aws s3 cp --only-show-errors extracted/infra/ec2/fetch-and-deploy.sh "s3://${ARTIFACT_BUCKET}/bootstrap/fetch-and-deploy.sh"
+
+      - name: Roll out to running instances (one at a time, stop on first failure)
+        run: |
+          targets=$(aws ec2 describe-instances \
+            --filters "Name=tag:App,Values=image-resizer" "Name=tag:Environment,Values=${ENV_TAG}" "Name=instance-state-name,Values=running" \
+            --query 'length(Reservations[].Instances[])' --output text)
+          if [ "$targets" = "0" ]; then
+            echo "::warning::No running instances yet. The release is published; new instances deploy it on boot."
+            exit 0
+          fi
+          # Re-apply the (idempotent) bootstrap first so brand-new or drifted
+          # instances converge, then deploy. $AWS_REGION/$ARTIFACT_BUCKET below are
+          # expanded on the instance from its own deploy.conf, not here.
+          jq -n --arg deploy "/usr/local/sbin/image-resizer-deploy ${VERSION} ${SHA256}" '{commands: [
+            "set -eu",
+            ". /etc/image-resizer/deploy.conf",
+            "aws s3 cp --only-show-errors --region \"$AWS_REGION\" \"s3://$ARTIFACT_BUCKET/bootstrap/bootstrap.sh\" /root/image-resizer-bootstrap.sh",
+            "bash /root/image-resizer-bootstrap.sh --no-deploy",
+            $deploy
+          ]}' > ssm-params.json
+          command_id=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --comment "image-resizer ${VERSION}" \
+            --targets "Key=tag:App,Values=image-resizer" "Key=tag:Environment,Values=${ENV_TAG}" \
+            --max-concurrency 1 --max-errors 0 --timeout-seconds 1800 \
+            --parameters file://ssm-params.json \
+            --query Command.CommandId --output text)
+          echo "SSM command: ${command_id} (${targets} instance(s))"
+          for _ in $(seq 1 180); do
+            sleep 10
+            statuses=$(aws ssm list-command-invocations --command-id "$command_id" --query 'CommandInvocations[].Status' --output text)
+            echo "status: ${statuses:-pending}"
+            if [ -n "$statuses" ] && ! echo "$statuses" | grep -Eq 'Pending|InProgress|Delayed'; then break; fi
+          done
+          aws ssm list-command-invocations --command-id "$command_id" --details \
+            --query 'CommandInvocations[].{instance:InstanceId,status:Status,output:CommandPlugins[0].Output}' --output json
+          failed=$(aws ssm list-command-invocations --command-id "$command_id" --query "length(CommandInvocations[?Status!='Success'])" --output text)
+          [ "$failed" = "0" ] || { echo "::error::Deployment failed on ${failed} instance(s); they rolled back automatically."; exit 1; }
+
+      - name: Record the release new instances should boot with
+        run: echo "${VERSION} ${SHA256}" | aws s3 cp --only-show-errors - "s3://${ARTIFACT_BUCKET}/releases/LATEST"
+
+      - name: Smoke test through CloudFront
+        if: env.PUBLIC_URL != ''
+        run: curl -fsS --retry 5 --retry-delay 5 "${PUBLIC_URL%/}/api/v1/health"
+
+  deploy-web:
+    name: Deploy SPA (S3 + CloudFront)
+    needs: [build, deploy-api]
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SITE_BUCKET: ${{ vars.SITE_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: dist
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: image-resizer-web-${{ github.run_id }}
+
+      - name: Upload fingerprinted assets (immutable, kept for clients on the old index)
+        run: aws s3 sync dist/assets "s3://${SITE_BUCKET}/assets" --only-show-errors --cache-control "public, max-age=31536000, immutable"
+
+      - name: Upload entry points (always revalidated)
+        run: aws s3 sync dist "s3://${SITE_BUCKET}" --only-show-errors --exclude "assets/*" --delete --cache-control "no-cache"
+
+      - name: Invalidate the HTML entry point
+        run: aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/" "/index.html" --query Invalidation.Id --output text
+
+      - name: Smoke test
+        if: env.PUBLIC_URL != ''
+        run: curl -fsS --retry 5 --retry-delay 10 "${PUBLIC_URL%/}/" | grep -q '<div id="root">'

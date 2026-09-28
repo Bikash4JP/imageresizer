@@ -1,0 +1,619 @@
+openapi: 3.1.0
+info:
+  title: Image Resizer API
+  version: 1.0.0
+  summary: Resize, crop, rotate, convert and compress images to a target file size.
+  description: |
+    Stateless image processing. Each request uploads one image and receives the
+    processed bytes in the response body; nothing is stored. Uploads live in a
+    private per-request directory that is deleted as soon as the response
+    closes. All metadata (EXIF, GPS, XMP, ICC) is stripped from outputs.
+
+    **Order of operations:** EXIF auto-orientation → `rotate` (clockwise) →
+    `flipH`/`flipV` (in the rotated frame) → `crop` (coordinates in that same
+    frame) → `resize` → flatten onto `background` (JPEG only) → encode.
+
+    Errors use [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem details.
+  license:
+    name: UNLICENSED
+    identifier: UNLICENSED
+servers:
+  - url: /api/v1
+    description: Same origin (CloudFront routes /api/* to the API; Vite proxies it in development)
+tags:
+  - name: Images
+    description: Image processing.
+  - name: Operations
+    description: Health, readiness and server capabilities.
+  - name: Feedback
+    description: Public ratings and the review wall.
+  - name: Admin
+    description: Review moderation. Mounted only when admin credentials are configured.
+paths:
+  /images/process:
+    post:
+      tags: [Images]
+      operationId: processImage
+      summary: Process one image
+      description: |
+        Rate limited per client (default 30 requests / 60 s per instance). CPU
+        work is bounded by a concurrency gate; when its queue is full the API
+        answers `503 server_busy` with `Retry-After` instead of degrading.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: |
+                    Exactly one image: JPEG, PNG, WebP, AVIF, GIF (first frame) or TIFF (first page).
+                    Identified by its content (magic bytes), never by filename or declared type.
+                    SVG, HEIC, PDF and everything else are rejected with 415.
+                options:
+                  type: string
+                  contentMediaType: application/json
+                  contentSchema:
+                    $ref: '#/components/schemas/ProcessOptions'
+                  maxLength: 4096
+                  description: JSON-encoded ProcessOptions. Omit for defaults (re-encode, strip metadata).
+            encoding:
+              options:
+                contentType: text/plain
+      responses:
+        '200':
+          description: The processed image. Offered as a download named `<original-stem>-processed.<ext>`.
+          headers:
+            Content-Disposition:
+              schema: { type: string, example: 'attachment; filename="holiday-photo-processed.webp"' }
+            Cache-Control:
+              schema: { type: string, const: no-store }
+            X-Output-Width: { schema: { type: integer } }
+            X-Output-Height: { schema: { type: integer } }
+            X-Output-Bytes: { schema: { type: integer } }
+            X-Output-Format: { schema: { $ref: '#/components/schemas/OutputFormat' } }
+            X-Output-Quality:
+              description: Encoder quality used, or `lossless`.
+              schema: { type: string, examples: ['82', lossless] }
+            X-Target-Met:
+              description: '`true`/`false` when `targetSizeBytes` was set, otherwise `n/a`.'
+              schema: { type: string, enum: ['true', 'false', n/a] }
+            X-Downscaled:
+              description: '`true` if pixel dimensions were reduced to meet the target size.'
+              schema: { type: string, enum: ['true', 'false'] }
+            X-Input-Width: { schema: { type: integer }, description: After EXIF orientation. }
+            X-Input-Height: { schema: { type: integer }, description: After EXIF orientation. }
+            X-Input-Bytes: { schema: { type: integer } }
+            X-Input-Format: { schema: { type: string, enum: [jpeg, png, webp, gif, tiff, avif] } }
+            X-Processing-Time-Ms: { schema: { type: integer } }
+            X-Request-Id: { $ref: '#/components/headers/RequestId' }
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/png: { schema: { type: string, format: binary } }
+            image/webp: { schema: { type: string, format: binary } }
+            image/avif: { schema: { type: string, format: binary } }
+        '400': { $ref: '#/components/responses/Problem' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Busy' }
+  /capabilities:
+    get:
+      tags: [Operations]
+      operationId: getCapabilities
+      summary: Limits and supported formats
+      description: Lets clients mirror server policy instead of hard-coding it. Cacheable for 5 minutes.
+      responses:
+        '200':
+          description: Current limits.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Capabilities' }
+        '403': { $ref: '#/components/responses/Problem' }
+  /feedback:
+    get:
+      tags: [Feedback]
+      operationId: getFeedback
+      summary: Review wall data
+      description: Rating summary over all ratings plus up to 40 newest published comments. `{enabled:false}` when an admin hid the wall.
+      responses:
+        '200':
+          description: Wall content, cacheable for 30 seconds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicFeedback' }
+        '403': { $ref: '#/components/responses/Problem' }
+    post:
+      tags: [Feedback]
+      operationId: submitFeedback
+      summary: Submit a rating
+      description: |
+        Rate limited per client IP (default 5 per hour). Text is cleaned of invisible and
+        bidi-override characters. Comments with links, emails or phone numbers are held
+        for moderation (`status: pending`), as is everything when FEEDBACK_MODERATION=manual.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FeedbackSubmission' }
+      responses:
+        '201':
+          description: Received.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [received, status]
+                properties:
+                  received: { type: boolean, const: true }
+                  status: { type: string, enum: [published, pending] }
+        '400': { $ref: '#/components/responses/Problem' }
+        '413': { $ref: '#/components/responses/Problem' }
+        '415': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /admin/login:
+    post:
+      tags: [Admin]
+      operationId: adminLogin
+      summary: Sign in
+      description: Sets the session cookie. At most 10 failed attempts per 15 minutes per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                password: { type: string, minLength: 1, maxLength: 1024, format: password }
+      responses:
+        '200':
+          description: Signed in.
+          headers:
+            Set-Cookie:
+              description: '`__Host-ir_admin` (production) or `ir_admin`; HttpOnly; SameSite=Strict; Path=/; Secure in production.'
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authenticated: { type: boolean, const: true }
+                  expiresInSeconds: { type: integer }
+        '401': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /admin/logout:
+    post:
+      tags: [Admin]
+      operationId: adminLogout
+      summary: Sign out
+      responses:
+        '200':
+          description: Cookie cleared.
+          content:
+            application/json:
+              schema: { type: object, properties: { authenticated: { type: boolean, const: false } } }
+        '404': { $ref: '#/components/responses/Problem' }
+  /admin/session:
+    get:
+      tags: [Admin]
+      operationId: adminSession
+      summary: Is the browser signed in?
+      responses:
+        '200':
+          description: Session state.
+          content:
+            application/json:
+              schema: { type: object, required: [authenticated], properties: { authenticated: { type: boolean } } }
+        '404': { $ref: '#/components/responses/Problem' }
+  /admin/overview:
+    get:
+      tags: [Admin]
+      operationId: adminOverview
+      summary: Counts, rating summary and site settings
+      security: [{ adminSession: [] }]
+      responses:
+        '200':
+          description: Overview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminOverview' }
+        '401': { $ref: '#/components/responses/Problem' }
+  /admin/feedback:
+    get:
+      tags: [Admin]
+      operationId: adminListFeedback
+      summary: List reviews by status, newest first
+      security: [{ adminSession: [] }]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/FeedbackStatus' } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+        - { name: cursor, in: query, description: '`nextCursor` from the previous page.', schema: { type: string, maxLength: 512 } }
+      responses:
+        '200':
+          description: A page of reviews.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AdminReview' } }
+                  nextCursor: { type: string }
+        '401': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+  /admin/feedback/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-z]{9}[0-9a-f]{12}$' } }
+    patch:
+      tags: [Admin]
+      operationId: adminSetFeedbackStatus
+      summary: Publish, hold or hide a review
+      description: Hiding keeps the rating in the average; only deletion removes it.
+      security: [{ adminSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/FeedbackStatus' }
+      responses:
+        '200':
+          description: Updated review.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminReview' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+    delete:
+      tags: [Admin]
+      operationId: adminDeleteFeedback
+      summary: Delete a review and its rating
+      security: [{ adminSession: [] }]
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Problem' }
+        '404': { $ref: '#/components/responses/Problem' }
+  /admin/settings:
+    put:
+      tags: [Admin]
+      operationId: adminUpdateSettings
+      summary: Show or hide the review wall
+      security: [{ adminSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SiteSettings' }
+      responses:
+        '200':
+          description: New settings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SiteSettings' }
+        '401': { $ref: '#/components/responses/Problem' }
+        '422': { $ref: '#/components/responses/Problem' }
+  /health:
+    get:
+      tags: [Operations]
+      operationId: getHealth
+      summary: Liveness
+      description: Exempt from origin verification so load balancers can probe it.
+      security: []
+      responses:
+        '200':
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version, uptimeSeconds]
+                properties:
+                  status: { type: string, const: ok }
+                  version: { type: string }
+                  uptimeSeconds: { type: integer }
+  /ready:
+    get:
+      tags: [Operations]
+      operationId: getReadiness
+      summary: Readiness / load
+      description: 503 while the processing queue is full. Exempt from origin verification.
+      security: []
+      responses:
+        '200':
+          description: Accepting work.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Saturated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+security:
+  - {}
+  - originVerify: []
+
+components:
+  securitySchemes:
+    adminSession:
+      type: apiKey
+      in: cookie
+      name: __Host-ir_admin
+      description: HMAC-signed session from POST /admin/login (named ir_admin outside production).
+    originVerify:
+      type: apiKey
+      in: header
+      name: X-Origin-Verify
+      description: |
+        Not a client credential. When ORIGIN_VERIFY_SECRET is configured, CloudFront
+        injects this header and the origin rejects requests without it (403), so the
+        origin cannot be reached around the CDN. Browsers never send it.
+  headers:
+    RequestId:
+      description: Correlates the response with server logs. A well-formed inbound X-Request-Id (8–64 chars of [A-Za-z0-9_-]) is propagated; otherwise a UUID is generated.
+      schema: { type: string }
+  responses:
+    Problem:
+      description: RFC 9457 problem details.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: Too many requests from this client.
+      headers:
+        Retry-After: { schema: { type: integer } }
+        RateLimit: { schema: { type: string }, description: IETF draft-8 RateLimit header. }
+        RateLimit-Policy: { schema: { type: string } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Busy:
+      description: Processing queue full (`server_busy`) or the job exceeded its time budget (`processing_timeout`).
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+  schemas:
+    FeedbackStatus:
+      type: string
+      enum: [published, pending, hidden]
+      default: published
+    FeedbackSubmission:
+      type: object
+      additionalProperties: false
+      required: [rating]
+      properties:
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        comment: { type: string, maxLength: 500, default: '' }
+        name: { type: string, maxLength: 40, default: '', description: Shown publicly; blank means Anonymous. }
+        website: { type: string, maxLength: 200, description: Honeypot. Must be empty. }
+    RatingSummary:
+      type: object
+      required: [average, count, distribution]
+      properties:
+        average: { type: number, description: One decimal place; 0 when there are no ratings. }
+        count: { type: integer }
+        distribution:
+          type: object
+          properties:
+            '1': { type: integer }
+            '2': { type: integer }
+            '3': { type: integer }
+            '4': { type: integer }
+            '5': { type: integer }
+    Review:
+      type: object
+      required: [id, rating, comment, name, createdAt]
+      properties:
+        id: { type: string }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        comment: { type: string }
+        name: { type: string }
+        createdAt: { type: string, format: date-time }
+    AdminReview:
+      allOf:
+        - $ref: '#/components/schemas/Review'
+        - type: object
+          required: [status, updatedAt]
+          properties:
+            status: { $ref: '#/components/schemas/FeedbackStatus' }
+            updatedAt: { type: string, format: date-time }
+    PublicFeedback:
+      oneOf:
+        - type: object
+          required: [enabled]
+          properties:
+            enabled: { type: boolean, const: false }
+        - type: object
+          required: [enabled, summary, items]
+          properties:
+            enabled: { type: boolean, const: true }
+            summary: { $ref: '#/components/schemas/RatingSummary' }
+            items: { type: array, maxItems: 40, items: { $ref: '#/components/schemas/Review' } }
+    SiteSettings:
+      type: object
+      additionalProperties: false
+      required: [wallEnabled]
+      properties:
+        wallEnabled: { type: boolean }
+    AdminOverview:
+      type: object
+      required: [settings, summary, counts]
+      properties:
+        settings: { $ref: '#/components/schemas/SiteSettings' }
+        summary: { $ref: '#/components/schemas/RatingSummary' }
+        counts:
+          type: object
+          properties:
+            published: { type: integer }
+            pending: { type: integer }
+            hidden: { type: integer }
+    OutputFormat:
+      type: string
+      enum: [jpeg, png, webp, avif]
+    CropRegion:
+      type: object
+      additionalProperties: false
+      required: [left, top, width, height]
+      description: Pixels of the oriented, rotated and flipped image. Must lie fully inside it.
+      properties:
+        left: { type: integer, minimum: 0 }
+        top: { type: integer, minimum: 0 }
+        width: { type: integer, minimum: 1 }
+        height: { type: integer, minimum: 1 }
+    Resize:
+      type: object
+      additionalProperties: false
+      description: At least one of width/height. With one, the aspect ratio is preserved.
+      anyOf:
+        - required: [width]
+        - required: [height]
+      properties:
+        width: { type: integer, minimum: 1, maximum: 10000, description: Bounded by MAX_OUTPUT_DIMENSION. }
+        height: { type: integer, minimum: 1, maximum: 10000 }
+        fit:
+          type: string
+          enum: [cover, contain, fill, inside, outside]
+          default: inside
+          description: |
+            `cover` fills the box and trims overflow · `contain` letterboxes with `background` ·
+            `fill` stretches · `inside` fits within the box · `outside` covers the box without trimming.
+        position:
+          type: string
+          enum: [center, attention, entropy]
+          default: center
+          description: What `cover` keeps. `attention` favours salient regions (faces, skin, saturated colour); `entropy` favours detail.
+        withoutEnlargement:
+          type: boolean
+          default: false
+    ProcessOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        crop: { $ref: '#/components/schemas/CropRegion' }
+        rotate: { type: integer, enum: [0, 90, 180, 270], default: 0, description: 'Clockwise, after EXIF orientation.' }
+        flipH: { type: boolean, default: false, description: Mirror left↔right in the rotated frame. }
+        flipV: { type: boolean, default: false, description: Mirror top↔bottom in the rotated frame. }
+        resize: { $ref: '#/components/schemas/Resize' }
+        format:
+          type: string
+          enum: [original, jpeg, png, webp, avif]
+          default: original
+          description: '`original` keeps JPEG/PNG/WebP/AVIF; GIF and TIFF become PNG (with alpha) or JPEG.'
+        quality:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 82
+          description: JPEG/WebP/AVIF quality. With a target size it is the upper bound. PNG is lossless unless a target forces palette quantisation.
+        targetSizeBytes:
+          type: integer
+          minimum: 1024
+          maximum: 209715200
+          description: |
+            Byte budget. The highest quality that fits is found by binary search; if even
+            the quality floor (40) is too large and `allowDownscale` is true, dimensions are
+            reduced instead. `X-Target-Met: false` reports an unreachable budget honestly.
+        allowDownscale: { type: boolean, default: true }
+        background:
+          description: Letterbox fill for `contain`, and the flatten colour for JPEG. `transparent` applies to PNG/WebP/AVIF.
+          oneOf:
+            - { type: string, pattern: '^#[0-9a-fA-F]{6}$' }
+            - { type: string, const: transparent }
+          default: '#ffffff'
+      examples:
+        - resize: { width: 1200 }
+          format: webp
+          quality: 80
+        - crop: { left: 0, top: 321, width: 3000, height: 1688 }
+          rotate: 90
+          resize: { width: 1080, height: 1080, fit: cover, position: attention }
+          format: jpeg
+          targetSizeBytes: 204800
+    Capabilities:
+      type: object
+      required: [maxUploadBytes, maxInputPixels, maxOutputDimension, maxOutputPixels, inputFormats, outputFormats, fitModes, positions, targetSize]
+      properties:
+        maxUploadBytes: { type: integer }
+        maxInputPixels: { type: integer }
+        maxOutputDimension: { type: integer }
+        maxOutputPixels: { type: integer }
+        inputFormats: { type: array, items: { type: string } }
+        outputFormats: { type: array, items: { $ref: '#/components/schemas/OutputFormat' } }
+        fitModes: { type: array, items: { type: string } }
+        positions: { type: array, items: { type: string } }
+        targetSize:
+          type: object
+          properties:
+            minBytes: { type: integer }
+            maxBytes: { type: integer }
+    Readiness:
+      type: object
+      required: [status, active, queued, concurrency]
+      properties:
+        status: { type: string, enum: [ready, saturated] }
+        active: { type: integer }
+        queued: { type: integer }
+        concurrency: { type: integer }
+    Problem:
+      type: object
+      required: [type, title, status, code, requestId]
+      properties:
+        type: { type: string, examples: ['urn:image-resizer:problem:validation_failed'] }
+        title: { type: string, description: 'Human-readable; safe to show to end users.' }
+        status: { type: integer }
+        code:
+          type: string
+          description: Stable machine-readable error code.
+          enum:
+            - file_required
+            - invalid_upload
+            - invalid_options
+            - invalid_request
+            - forbidden
+            - origin_not_allowed
+            - not_found
+            - file_too_large
+            - image_too_large
+            - unsupported_media_type
+            - validation_failed
+            - invalid_image
+            - crop_out_of_bounds
+            - output_too_large
+            - rate_limited
+            - internal_error
+            - server_busy
+            - processing_timeout
+            - unauthorized
+            - invalid_credentials
+            - invalid_cursor
+        errors:
+          type: array
+          description: Field-level details for `validation_failed`.
+          items:
+            type: object
+            required: [path, message]
+            properties:
+              path: { type: string, examples: [resize.width] }
+              message: { type: string }
+        requestId: { type: string }

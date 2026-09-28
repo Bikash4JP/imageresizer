@@ -1,0 +1,57 @@
+[Unit]
+Description=Image Resizer API (see docs/DEPLOYMENT.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=image-resizer
+Group=image-resizer
+WorkingDirectory=/opt/image-resizer/current/server
+EnvironmentFile=/etc/image-resizer/env
+# Enforced here so a missing/edited parameter can never downgrade the runtime mode.
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+ExecStart=/usr/local/bin/node dist/index.js
+Restart=on-failure
+RestartSec=3
+# The app drains in-flight requests on SIGTERM for up to 30 s.
+KillSignal=SIGTERM
+TimeoutStopSec=35
+
+# --- Sandboxing --------------------------------------------------------------
+# Uploads live under the service's private /tmp (PrivateTmp), which systemd
+# wipes whenever the service stops — a final backstop for temp-file deletion.
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+# V8's JIT needs writable+executable memory, so MemoryDenyWriteExecute stays off.
+
+# --- Resource limits ---------------------------------------------------------
+MemoryMax=80%
+TasksMax=512
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

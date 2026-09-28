@@ -1,0 +1,86 @@
+# =============================================================================
+# Secrets & credentials — never commit these. Real values live in AWS SSM
+# Parameter Store / Secrets Manager (prod) or local, untracked .env files (dev).
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+.envrc
+.secrets/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*.ppk
+.aws/
+aws-exports.js
+credentials
+credentials.json
+service-account*.json
+.npmrc.local
+.netrc
+terraform.tfvars
+*.auto.tfvars
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# =============================================================================
+# Dependencies & build output
+# =============================================================================
+node_modules/
+dist/
+build/
+out/
+.vite/
+*.tsbuildinfo
+release/
+*.tgz
+
+# =============================================================================
+# Runtime artefacts — uploaded/processed images must never reach VCS
+# =============================================================================
+tmp/
+temp/
+uploads/
+.imageresizer-tmp/
+# Local feedback store (real user comments) — FEEDBACK_STORE=file in development
+.data/
+*.log
+logs/
+npm-debug.log*
+pids/
+*.pid
+*.seed
+e2e/artifacts/
+
+# =============================================================================
+# Test & coverage
+# =============================================================================
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+junit.xml
+
+# =============================================================================
+# Editors / OS
+# =============================================================================
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

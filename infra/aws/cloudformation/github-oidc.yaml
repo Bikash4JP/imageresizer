@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Image Resizer CI/CD identity - lets GitHub Actions assume a narrowly scoped
+  deploy role through OpenID Connect. No long-lived AWS keys exist anywhere.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9-]+$'
+  GitHubRepository:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+  GitHubEnvironment:
+    Type: String
+    Default: production
+    Description: Only workflow jobs running in this GitHub environment (with its protection rules) can assume the role.
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: ARN of an existing token.actions.githubusercontent.com provider in this account; leave empty to create one.
+  SiteBucketName:
+    Type: String
+    Description: Output SiteBucketName of the edge stack.
+  DistributionId:
+    Type: String
+    Description: Output DistributionId of the edge stack.
+  ArtifactBucketName:
+    Type: String
+    Description: Output ArtifactBucketName of the compute stack.
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Must match the compute stack; SSM commands are restricted to instances with this Environment tag.
+
+Conditions:
+  CreateProvider: !Equals [!Ref ExistingOidcProviderArn, '']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Assumed by GitHub Actions (environment-scoped) to deploy Image Resizer.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepository}:environment:${GitHubEnvironment}'
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: PublishSpa
+                Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SiteBucketName}'
+              - Sid: PublishSpaObjects
+                Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:GetObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SiteBucketName}/*'
+              - Sid: InvalidateCdn
+                Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${DistributionId}'
+              - Sid: PublishReleases
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/releases/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/bootstrap/*'
+              - Sid: RunDeployDocument
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript'
+              - Sid: RunOnTaggedInstancesOnly
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/App: image-resizer
+                    ssm:resourceTag/Environment: !Ref EnvironmentName
+              - Sid: TrackDeployCommand
+                Effect: Allow
+                Action: [ssm:ListCommandInvocations, ssm:GetCommandInvocation]
+                Resource: '*'
+              - Sid: FindTargets
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+
+Outputs:
+  DeployRoleArn:
+    Description: GitHub environment variable AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt DeployRole.Arn
