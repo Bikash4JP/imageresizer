@@ -17,7 +17,7 @@
     "admin:hash-password": "tsx src/cli/hashPassword.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "3.1141.0",
+    "@aws-sdk/client-dynamodb": "3.1156.0",
     "@aws-sdk/lib-dynamodb": "3.1141.0",
     "express": "5.2.1",
     "express-rate-limit": "8.7.0",
